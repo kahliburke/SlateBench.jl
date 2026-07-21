@@ -73,8 +73,9 @@
           <label>grid n</label><input class="sb-n" type="number" value="${p.n||64}" min="16" max="512" step="16">
           <label>frames</label><input class="sb-f" type="number" value="${p.frames||2000}" min="100" step="100">
           <label>delay ms</label><input class="sb-d" type="number" value="${p.delayMs||0}" min="0" step="1">
+          <label class="sb-binlab"><input class="sb-bin" type="checkbox" checked> binary</label>
           <button class="sb-go">▶ Run</button>
-          <span class="sb-path">path: JSON</span>
+          <span class="sb-path">path: binary</span>
         </div>
         <div class="sb-main">
           <canvas class="sb-field" width="64" height="64" title="the streamed field"></canvas>
@@ -82,7 +83,7 @@
             <div class="sb-tile"><span>recv fps</span><b class="k_fps" style="color:${C.fps}">—</b></div>
             <div class="sb-tile"><span>float MB/s</span><b class="k_mbs" style="color:${C.thru}">—</b></div>
             <div class="sb-tile"><span>drop rate</span><b class="k_drop" style="color:${C.drop}">—</b></div>
-            <div class="sb-tile"><span>p95 lat drift</span><b class="k_p95" style="color:${C.lat}">—</b></div>
+            <div class="sb-tile"><span>p95 latency</span><b class="k_p95" style="color:${C.lat}">—</b></div>
           </div>
         </div>
         <div class="sb-charts">
@@ -107,6 +108,7 @@
     };
 
     // stream handler — CHEAP: count + collect, no render (keeps transport measurement clean)
+    const WARMUP = 10;   // first frames carry JIT/connection/buffer warm-up — excluded from latency + jitter
     window.slateOnStream && window.slateOnStream(channel, msg => {
       if (!S || S.finalized || msg.r !== S.runId) return;   // ignore frames draining from a prior run
       S.lastFrame = performance.now();
@@ -115,15 +117,23 @@
       if (S.first === null) { S.first = now; S.bucket = now; }
       if (i > S.lastIdx + 1) S.gaps += i - S.lastIdx - 1;
       S.lastIdx = i; S.recv++;
-      if (S.prev !== null) S.iat.push((now - S.prev) * 1000);
+      const warm = S.recv > WARMUP;
+      if (S.prev !== null && warm) S.iat.push((now - S.prev) * 1000);
       S.prev = now; S.last = now;
-      if (S.offset === null) S.offset = now - msg.t;
-      const drift = (now - msg.t - S.offset) * 1000;
-      S.lat.push(drift); if (drift > S.latMax) S.latMax = drift;
+      warm && S.lat.push((now - msg.t) * 1000);   // raw one-way delta (ms), post-warmup; min-anchored at display
       // throughput bucket (100ms): float bytes/sec
       S.bucketBytes += d.length * 4;
       if (now - S.bucket >= 0.1) { S.thru.push(S.bucketBytes / (now - S.bucket) / 1e6); S.bucket = now; S.bucketBytes = 0; }
     });
+
+    // Latency ABOVE THE FLOOR: each frame's one-way delta minus the smallest observed (which absorbs the
+    // unknown send/recv clock offset + the minimum transit). 0 = the fastest frame; growth = the pipeline
+    // backing up. Never negative — the fix for the earlier "negative drift".
+    const relLat = () => {
+      if (!S.lat.length) return [];
+      let mn = S.lat[0]; for (const x of S.lat) if (x < mn) mn = x;
+      return S.lat.map(x => x - mn);
+    };
 
     // Finalize a run once emission is done AND delivery has drained (async delivery lags a burst) — freeze
     // stats + write the summary. `recv/sent` is the true drop rate; `MB/s delivered` uses the receive window.
@@ -134,7 +144,7 @@
       const r = S.final; if (!r) { if (!q(".sb-sum").textContent) q(".sb-sum").textContent = "no frames delivered"; return; }
       const elapsed = (S.last && S.first) ? (S.last - S.first) : 0;               // seconds
       const recvMBs = elapsed > 0 ? S.recv * r.bytes_per_frame / elapsed / 1e6 : 0;
-      const sorted = S.lat.slice().sort((a, b) => a - b);
+      const sorted = relLat().sort((a, b) => a - b);
       q(".sb-sum").innerHTML =
         `sent <b>${r.sent}</b> @ ${fmt(r.sent / (r.dur_ms/1000), 0)} fps · recv <b>${S.recv}</b> ` +
         `(<b style="color:${C.drop}">${fmt(100*(1 - S.recv/r.sent),1)}%</b> dropped) · ` +
@@ -156,14 +166,14 @@
       if (S && !S.finalized && t - lastChart > 120) {
         lastChart = t;
         area(thruCx, 330, 76, S.thru.slice(-160), C.thru, "throughput  MB/s");
-        hist(latCx, 220, 76, S.lat, C.lat, "latency drift", "ms");
+        hist(latCx, 220, 76, relLat(), C.lat, "latency (above floor)", "ms");
         hist(iatCx, 220, 76, S.iat, C.fps, "inter-arrival", "ms");
         const elapsed = (S.last && S.first) ? S.last - S.first : 0, fps = elapsed > 0 ? S.recv / elapsed : 0;
         q(".k_fps").textContent = fmt(fps, 0);
         q(".k_mbs").textContent = fmt(fps * gridN * gridN * 4 / 1e6, 1);
         const sent = S.final ? S.final.sent : S.lastIdx;
         q(".k_drop").textContent = sent > 0 ? fmt(100 * (1 - S.recv / sent), 1) + "%" : "—";
-        const sorted = S.lat.slice().sort((a, b) => a - b);
+        const sorted = relLat().sort((a, b) => a - b);
         q(".k_p95").textContent = fmt(pctile(sorted, 0.95), 0) + "ms";
       }
       raf = requestAnimationFrame(draw);
@@ -173,10 +183,12 @@
 
     q(".sb-go").onclick = async () => {
       const n = +q(".sb-n").value, frames = +q(".sb-f").value, delayMs = +q(".sb-d").value;
+      const bin = q(".sb-bin").checked;
       resetStats(n); S.runId = ++runSeq;
+      q(".sb-path").textContent = "path: " + (bin ? "binary" : "JSON");
       const go = q(".sb-go"); go.disabled = true; go.textContent = "streaming…"; q(".sb-sum").textContent = "";
       try {
-        const r = await api.call(channel + ":run", { n, frames, delayMs, run: S.runId });
+        const r = await api.call(channel + ":run", { n, frames, delayMs, run: S.runId, bin });
         S.emitDone = true; S.final = r;
         if (S.lastFrame === 0) S.lastFrame = performance.now();     // arm the watchdog even if nothing arrived
       } catch (e) {
