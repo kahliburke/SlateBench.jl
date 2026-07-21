@@ -74,17 +74,27 @@ field over `slate_emit` (throttled by `delayMs`, `0` = as fast as possible), cha
 latency drift. `name` is the `slate_emit`/RPC channel. The `run` handler is wired automatically through
 SlateExtensionsBase's `slate_on` accessor — the notebook just returns the value.
 """
-function bench_stream(; n::Integer = 64, frames::Integer = 2000, delayMs::Real = 0, name::AbstractString = "bench")
+# Register the `<name>:run` RPC handler that ▶ Run invokes. Factored out so BOTH `bench_stream` (for a
+# custom `name`) and `__slate_frontend` (for the default channel) install it. `slate_on` replaces by
+# channel, so calling it twice is idempotent.
+_register_run_handler!(slate_on, name::AbstractString) =
     slate_on("$name:run", a -> run_stress(String(name), Int(a.n), Int(a.frames), Float64(a.delayMs),
                                           Int(hasproperty(a, :run) ? a.run : 0),
                                           hasproperty(a, :bin) && a.bin == true))
+
+function bench_stream(; n::Integer = 64, frames::Integer = 2000, delayMs::Real = 0, name::AbstractString = "bench")
+    _register_run_handler!(slate_on, String(name))
     return StreamBench(Dict{String,Any}(
         "channel" => String(name), "n" => Int(n), "frames" => Int(frames), "delayMs" => Float64(delayMs)))
 end
 
-# The dashboard renderer loads once, package-globally, from `using SlateBench`.
+# Package-global front-end + handler wiring, re-fired per namespace generation from `using SlateBench` —
+# so the dashboard JS and the default `bench:run` handler are BOTH present on a fresh worker even when the
+# dash cell's output is memo-restored rather than re-executed (registering the handler only inside
+# `bench_stream` left it missing after a restore → "no slate_on handler registered for channel 'bench:run'").
 function __slate_frontend(slate_on)
     provide_frontend!(@pkg_asset("assets/bench.js"); id = "SlateBench.bench")
+    _register_run_handler!(slate_on, "bench")
 end
 
 end # module
