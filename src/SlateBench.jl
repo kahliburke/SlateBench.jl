@@ -16,6 +16,31 @@ using SlateExtensionsBase
 
 export StreamBench, bench_stream
 
+# ── Pacing ────────────────────────────────────────────────────────────────────
+# Wait `ms` milliseconds between frames, accurately. `sleep` is a libuv timer on a busy event loop, so
+# it is useless as a pacer at benchmark scale: it has a ~1ms floor AND overshoots its argument by a
+# growing margin (a sub-millisecond request still costs milliseconds). Left unhandled that silently
+# clamps the frame rate to a few hundred fps — a pacer artifact that masquerades as a transport ceiling
+# on small frames, where a frame costs microseconds.
+#
+# So pace against a DEADLINE instead of trusting any single sleep. While more than `SPIN_MS` remains we
+# sleep a conservative fraction of the remaining time — `SLEEP_DIVISOR` exceeds the worst observed
+# overshoot ratio, so a chunk cannot overrun the deadline — and the last stretch is spun on the
+# monotonic clock. That yields microsecond accuracy at any delay while only the final `SPIN_MS` burns
+# CPU. `yield()` throughout keeps the PUB flushing and the worker responsive.
+const SPIN_MS = 4.0
+const SLEEP_DIVISOR = 5.0
+
+function pace(ms::Float64)
+    tend = time_ns() + round(UInt64, ms * 1e6)
+    while true
+        remaining_ms = (signed(tend) - signed(time_ns())) / 1e6
+        remaining_ms <= 0 && break
+        remaining_ms > SPIN_MS ? sleep(remaining_ms / SLEEP_DIVISOR / 1000) : yield()
+    end
+    return nothing
+end
+
 # ── The emitter under test ────────────────────────────────────────────────────
 # Stream `frames` frames of an n×n Float32 plasma field over `slate_emit` — the exact worker→hub→browser
 # path we're optimizing. Each frame carries {i: index, t: hi-res send time, d: the flat field}, so the
@@ -38,7 +63,9 @@ function run_stress(channel::AbstractString, n::Int, frames::Int, delayMs::Float
         fld
     end
     t0 = time()
+    sent = 0
     for i in 1:frames
+        CURRENT_RUN[] == run || break     # a newer run superseded this one — abandon the old stream
         fld = variants[mod1(i, NVARIANTS)]
         # `r` tags the run so the receiver ignores frames still draining from a PRIOR run (else recv > sent).
         # BINARY: raw f32 bytes over the WS (SlateBinary copies via `collect`); JSON: the legacy 3-pass path.
@@ -47,10 +74,13 @@ function run_stress(channel::AbstractString, n::Int, frames::Int, delayMs::Float
         else
             slate_emit(channel, (i = i, t = time(), r = run, d = copy(fld)))
         end
-        delayMs > 0 && sleep(delayMs / 1000)
+        sent = i
+        delayMs > 0 && pace(delayMs)
         yield()                                     # let the PUB flush + keep the worker responsive
     end
-    return (; sent = frames, dur_ms = (time() - t0) * 1000, bytes_per_frame = n * n * 4)
+    # `sent` is what actually went out, which is NOT `frames` when a newer run cut this one short —
+    # reporting the request instead would show those abandoned frames as drops.
+    return (; sent = sent, dur_ms = (time() - t0) * 1000, bytes_per_frame = n * n * 4)
 end
 
 # ── The widget ────────────────────────────────────────────────────────────────
@@ -66,6 +96,44 @@ end
 
 SlateExtensionsBase.slate_render(b::StreamBench) = component("SlateBench.StreamBench", b.props)
 
+# ── Run control ───────────────────────────────────────────────────────────────
+# Streaming thousands of frames takes far longer than the browser's 30s RPC timeout, so the ▶ Run
+# call ALWAYS fails on a long run — and especially on a backed-up one, exactly the case the benchmark
+# exists to measure. Awaiting it therefore discarded a completed run's statistics: the reply was late,
+# not the work wrong.
+#
+# The stream CANNOT be moved off the handler's own task. `slate_emit` delivers only from a live run:
+# frames emitted from a detached task — spawned inside the handler OR from a cell whose run has since
+# finished — are accepted and then dropped silently, so the dashboard sees an accepted run deliver
+# nothing. Streaming therefore stays inline, and the RPC necessarily outlives the browser's timeout.
+#
+# So the browser is decoupled from the RPC's RETURN instead: the tally is also published as a
+# `<channel>:done` event, emitted inline while the run is still live, and the dashboard finalizes on
+# that. The reply is then pure redundancy — if it makes it back, fine; if it times out, the summary
+# has already been delivered by the event.
+const CURRENT_RUN = Ref(0)
+
+function start_run(channel::AbstractString, n::Int, frames::Int, delayMs::Float64, run::Int, bin::Bool)
+    CURRENT_RUN[] = run                  # supersedes any stream still running; it sees this and stops
+    tally = try
+        merge(run_stress(channel, n, frames, delayMs, run, bin), (; ok = true, error = ""))
+    catch e
+        # Report a failure on the SAME path as success — a silently dead stream would otherwise leave
+        # the dashboard waiting on frames that are never coming.
+        (; sent = 0, dur_ms = 0.0, bytes_per_frame = n * n * 4, ok = false, error = sprint(showerror, e))
+    end
+    slate_emit("$channel:done", merge(tally, (; r = run)))
+    return tally
+end
+
+# Register the `<name>:run` RPC handler that ▶ Run invokes. Factored out so BOTH `bench_stream` (for a
+# custom `name`) and `__slate_frontend` (for the default channel) install it. `slate_on` replaces by
+# channel, so calling it twice is idempotent.
+_register_run_handler!(slate_on, name::AbstractString) =
+    slate_on("$name:run", a -> start_run(String(name), Int(a.n), Int(a.frames), Float64(a.delayMs),
+                                         Int(hasproperty(a, :run) ? a.run : 0),
+                                         hasproperty(a, :bin) && a.bin == true))
+
 """
     bench_stream(; n=64, frames=2000, delayMs=0, name="bench") -> StreamBench
 
@@ -74,14 +142,6 @@ field over `slate_emit` (throttled by `delayMs`, `0` = as fast as possible), cha
 latency drift. `name` is the `slate_emit`/RPC channel. The `run` handler is wired automatically through
 SlateExtensionsBase's `slate_on` accessor — the notebook just returns the value.
 """
-# Register the `<name>:run` RPC handler that ▶ Run invokes. Factored out so BOTH `bench_stream` (for a
-# custom `name`) and `__slate_frontend` (for the default channel) install it. `slate_on` replaces by
-# channel, so calling it twice is idempotent.
-_register_run_handler!(slate_on, name::AbstractString) =
-    slate_on("$name:run", a -> run_stress(String(name), Int(a.n), Int(a.frames), Float64(a.delayMs),
-                                          Int(hasproperty(a, :run) ? a.run : 0),
-                                          hasproperty(a, :bin) && a.bin == true))
-
 function bench_stream(; n::Integer = 64, frames::Integer = 2000, delayMs::Real = 0, name::AbstractString = "bench")
     _register_run_handler!(slate_on, String(name))
     return StreamBench(Dict{String,Any}(
@@ -92,6 +152,11 @@ end
 # so the dashboard JS and the default `bench:run` handler are BOTH present on a fresh worker even when the
 # dash cell's output is memo-restored rather than re-executed (registering the handler only inside
 # `bench_stream` left it missing after a restore → "no slate_on handler registered for channel 'bench:run'").
+#
+# NOTE when editing the dashboard JS: `@pkg_asset` is a MACRO, so the file's contents are baked in when
+# this method is compiled. Re-running the cell re-serves the BAKED copy, not what is on disk — editing
+# `assets/bench.js` alone changes nothing in the browser. Restart the worker (or touch this method to
+# make Revise re-expand the macro), then reload the page.
 function __slate_frontend(slate_on)
     provide_frontend!(@pkg_asset("assets/bench.js"); id = "SlateBench.bench")
     _register_run_handler!(slate_on, "bench")

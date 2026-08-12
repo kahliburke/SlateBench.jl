@@ -104,7 +104,7 @@
       gridN = n; field.width = n; field.height = n; img = fcx.createImageData(n, n);
       S = { recv: 0, first: null, last: null, lastIdx: 0, gaps: 0, offset: null, latMax: 0,
             lat: [], iat: [], thru: [], bucket: null, bucketBytes: 0, prev: null,
-            emitDone: false, finalized: false, lastFrame: 0, final: null };
+            emitDone: false, finalized: false, lastFrame: 0, final: null, ack: null, error: null };
     };
 
     // stream handler — CHEAP: count + collect, no render (keeps transport measurement clean)
@@ -126,6 +126,16 @@
       if (now - S.bucket >= 0.1) { S.thru.push(S.bucketBytes / (now - S.bucket) / 1e6); S.bucket = now; S.bucketBytes = 0; }
     });
 
+    // Emission finished — the tally arrives as an EVENT, not as the ▶ Run RPC's return value, so a run
+    // that outlasts the RPC timeout still reports its statistics instead of failing (see `start_run`).
+    window.slateOnStream && window.slateOnStream(channel + ":done", msg => {
+      if (!S || S.finalized || msg.r !== S.runId) return;   // a superseded run's tally is not ours
+      S.emitDone = true;
+      S.final = msg.ok === false ? null : msg;
+      if (msg.ok === false) S.error = msg.error;
+      if (S.lastFrame === 0) S.lastFrame = performance.now();   // arm the drain watchdog even if nothing arrived
+    });
+
     // Latency ABOVE THE FLOOR: each frame's one-way delta minus the smallest observed (which absorbs the
     // unknown send/recv clock offset + the minimum transit). 0 = the fastest frame; growth = the pipeline
     // backing up. Never negative — the fix for the earlier "negative drift".
@@ -141,11 +151,22 @@
       if (!S || S.finalized) return;
       S.finalized = true;
       const go = q(".sb-go"); go.disabled = false; go.textContent = "▶ Run";
-      const r = S.final; if (!r) { if (!q(".sb-sum").textContent) q(".sb-sum").textContent = "no frames delivered"; return; }
+      // Fall back to the ACK's shape if the tally never arrived (worker gone, event lost). The frames
+      // we DID receive are still worth reporting — treating a missing tally as a failed run would
+      // throw away a whole stream's statistics over a lost final message.
+      const r = S.final || (S.ack && S.lastIdx > 0
+        ? { sent: S.lastIdx, dur_ms: (S.last && S.first) ? (S.last - S.first) * 1000 : 0,
+            bytes_per_frame: S.ack.bytes_per_frame, partial: true }
+        : null);
+      if (!r) {
+        q(".sb-sum").textContent = S.error ? "run failed: " + S.error : "no frames delivered";
+        return;
+      }
       const elapsed = (S.last && S.first) ? (S.last - S.first) : 0;               // seconds
       const recvMBs = elapsed > 0 ? S.recv * r.bytes_per_frame / elapsed / 1e6 : 0;
       const sorted = relLat().sort((a, b) => a - b);
       q(".sb-sum").innerHTML =
+        (r.partial ? `<span style="color:${C.lat}">partial (no final tally)</span> · ` : "") +
         `sent <b>${r.sent}</b> @ ${fmt(r.sent / (r.dur_ms/1000), 0)} fps · recv <b>${S.recv}</b> ` +
         `(<b style="color:${C.drop}">${fmt(100*(1 - S.recv/r.sent),1)}%</b> dropped) · ` +
         `<b style="color:${C.thru}">${fmt(recvMBs,1)} MB/s delivered</b> · ` +
@@ -163,6 +184,9 @@
       }
       const t = performance.now();
       if (S && S.emitDone && !S.finalized && t - S.lastFrame > 500) finalize();     // delivery drained
+      // Stall watchdog: the tally never came and frames stopped long ago. Without this the button
+      // stays disabled forever on a dead worker; finalize() reports what was received.
+      if (S && !S.emitDone && !S.finalized && S.lastFrame > 0 && t - S.lastFrame > 5000) finalize();
       if (S && !S.finalized && t - lastChart > 120) {
         lastChart = t;
         area(thruCx, 330, 76, S.thru.slice(-160), C.thru, "throughput  MB/s");
@@ -187,14 +211,23 @@
       resetStats(n); S.runId = ++runSeq;
       q(".sb-path").textContent = "path: " + (bin ? "binary" : "JSON");
       const go = q(".sb-go"); go.disabled = true; go.textContent = "streaming…"; q(".sb-sum").textContent = "";
-      try {
-        const r = await api.call(channel + ":run", { n, frames, delayMs, run: S.runId, bin });
+      S.ack = { bytes_per_frame: n * n * 4, frames };
+      // This RPC spans the WHOLE stream, so on a long or backed-up run it times out in the browser
+      // even though the run succeeded. It is therefore only a redundant path: the tally that matters
+      // arrives on `<channel>:done` (see `start_run`). A late reply is accepted if the event beat it
+      // here; a rejection is recorded but NOT surfaced, since the event carries the real outcome and
+      // the drain/stall watchdogs finalize regardless. Only a run that produced nothing at all — no
+      // frames, no tally — reports the error, because then it is the only evidence we have.
+      const runId = S.runId;
+      api.call(channel + ":run", { n, frames, delayMs, run: runId, bin }).then(r => {
+        if (!S || S.runId !== runId || S.finalized || S.final) return;
         S.emitDone = true; S.final = r;
-        if (S.lastFrame === 0) S.lastFrame = performance.now();     // arm the watchdog even if nothing arrived
-      } catch (e) {
-        if (S) { S.emitDone = true; S.final = null; S.lastFrame = performance.now(); }
-        q(".sb-sum").textContent = "run failed: " + ((e && e.message) || e);
-      }
+        if (S.lastFrame === 0) S.lastFrame = performance.now();
+      }).catch(e => {
+        if (!S || S.runId !== runId) return;
+        S.error = (e && e.message) || String(e);
+        if (S.lastFrame === 0) S.lastFrame = performance.now();   // arm the stall watchdog
+      });
     };
   }
 
