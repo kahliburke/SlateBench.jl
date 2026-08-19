@@ -47,12 +47,19 @@ end
 # receiver can measure drops (index gaps) and latency drift (recv − send).
 #
 # The plasma field is PRECOMPUTED into a small cycle of variants OUTSIDE the emit loop, so the O(n²)
-# sin/cos generation cost stays OUT of the measured throughput — this benchmarks the TRANSPORT (the
-# per-frame SlateBinary collect + encode + publish + wire + browser decode), not field synthesis, which
-# otherwise grows with frame size and dilutes exactly the large-frame numbers the transport work targets.
-# Cycling a handful of variants (not one static buffer) keeps the payload changing frame-to-frame so
-# nothing downstream can dedup it, while costing only `NVARIANTS` field-gens total regardless of `frames`.
-function run_stress(channel::AbstractString, n::Int, frames::Int, delayMs::Float64, run::Int, bin::Bool)
+# sin/cos generation cost stays OUT of the measured throughput — this benchmarks the TRANSPORT (per-frame
+# encode + publish + wire + browser decode), not field synthesis, which otherwise grows with frame size
+# and dilutes exactly the large-frame numbers the transport work targets. Cycling a handful of variants
+# (not one static buffer) keeps the payload changing frame-to-frame so nothing downstream can dedup it,
+# while costing only `NVARIANTS` field-gens total regardless of `frames`.
+#
+# `snapshot` picks what the binary path does with the payload: by reference (the default — the frame
+# reads the variant in place) or copied per frame. That copy is what a sender pays when it holds a
+# frame rather than emitting it, and it is the whole difference between the two on large fields, so
+# both belong on one dashboard. The JSON path always copies, which is worth remembering when reading
+# the two against each other: only `snapshot` on makes them like-for-like on that count.
+function run_stress(channel::AbstractString, n::Int, frames::Int, delayMs::Float64, run::Int,
+                    bin::Bool, snapshot::Bool)
     NVARIANTS = 8
     variants = map(1:NVARIANTS) do v
         ph = v * 0.15
@@ -68,9 +75,9 @@ function run_stress(channel::AbstractString, n::Int, frames::Int, delayMs::Float
         CURRENT_RUN[] == run || break     # a newer run superseded this one — abandon the old stream
         fld = variants[mod1(i, NVARIANTS)]
         # `r` tags the run so the receiver ignores frames still draining from a PRIOR run (else recv > sent).
-        # BINARY: raw f32 bytes over the WS (SlateBinary copies via `collect`); JSON: the legacy 3-pass path.
+        # BINARY: raw f32 bytes over the WS; JSON: the 3-pass serialize/base64/parse path.
         if bin
-            slate_emit(channel, SlateBinary(fld; i = i, t = time(), r = run))
+            slate_emit(channel, SlateBinary(fld; snapshot = snapshot, i = i, t = time(), r = run))
         else
             slate_emit(channel, (i = i, t = time(), r = run, d = copy(fld)))
         end
@@ -113,10 +120,11 @@ SlateExtensionsBase.slate_render(b::StreamBench) = component("SlateBench.StreamB
 # has already been delivered by the event.
 const CURRENT_RUN = Ref(0)
 
-function start_run(channel::AbstractString, n::Int, frames::Int, delayMs::Float64, run::Int, bin::Bool)
+function start_run(channel::AbstractString, n::Int, frames::Int, delayMs::Float64, run::Int,
+                   bin::Bool, snapshot::Bool)
     CURRENT_RUN[] = run                  # supersedes any stream still running; it sees this and stops
     tally = try
-        merge(run_stress(channel, n, frames, delayMs, run, bin), (; ok = true, error = ""))
+        merge(run_stress(channel, n, frames, delayMs, run, bin, snapshot), (; ok = true, error = ""))
     catch e
         # Report a failure on the SAME path as success — a silently dead stream would otherwise leave
         # the dashboard waiting on frames that are never coming.
@@ -132,7 +140,8 @@ end
 _register_run_handler!(slate_on, name::AbstractString) =
     slate_on("$name:run", a -> start_run(String(name), Int(a.n), Int(a.frames), Float64(a.delayMs),
                                          Int(hasproperty(a, :run) ? a.run : 0),
-                                         hasproperty(a, :bin) && a.bin == true))
+                                         hasproperty(a, :bin) && a.bin == true,
+                                         hasproperty(a, :snapshot) && a.snapshot == true))
 
 """
     bench_stream(; n=64, frames=2000, delayMs=0, name="bench") -> StreamBench

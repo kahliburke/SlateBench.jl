@@ -48,8 +48,10 @@ end
         # the old loop must stop rather than keep flooding the receiver — and its abandoned frames must
         # not be counted as sent, or they would show up as drops.
         SlateBench.CURRENT_RUN[] = 2
-        r = SlateBench.run_stress("test_probe", 4, 10_000, 0.0, 1, true)   # run 1 is already stale
+        r = SlateBench.run_stress("test_probe", 4, 10_000, 0.0, 1, true, false)   # run 1 is already stale
         @test r.sent == 0
         @test r.bytes_per_frame == 4 * 4 * 4
+        # Either payload mode supersedes the same way — the check is on the run, not on what it sends.
+        @test SlateBench.run_stress("test_probe", 4, 10_000, 0.0, 1, true, true).sent == 0
     end
 end

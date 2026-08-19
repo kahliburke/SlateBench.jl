@@ -74,8 +74,9 @@
           <label>frames</label><input class="sb-f" type="number" value="${p.frames||2000}" min="100" step="100">
           <label>delay ms</label><input class="sb-d" type="number" value="${p.delayMs||0}" min="0" step="1">
           <label class="sb-binlab"><input class="sb-bin" type="checkbox" checked> binary</label>
+          <label class="sb-binlab sb-snaplab" title="copy the field per frame instead of sending it by reference — only the binary path has the choice; JSON always copies"><input class="sb-snap" type="checkbox"> snapshot</label>
           <button class="sb-go">▶ Run</button>
-          <span class="sb-path">path: binary</span>
+          <span class="sb-path">path: binary · by ref</span>
         </div>
         <div class="sb-main">
           <canvas class="sb-field" width="64" height="64" title="the streamed field"></canvas>
@@ -205,11 +206,18 @@
     let raf = requestAnimationFrame(draw);
     el._sbStop = () => cancelAnimationFrame(raf);
 
+    // Snapshot is a binary-path choice: JSON copies either way, so the control is disabled there
+    // rather than sitting enabled and doing nothing.
+    const syncSnap = () => { q(".sb-snap").disabled = !q(".sb-bin").checked; };
+    q(".sb-bin").onchange = syncSnap; syncSnap();
+
     q(".sb-go").onclick = async () => {
       const n = +q(".sb-n").value, frames = +q(".sb-f").value, delayMs = +q(".sb-d").value;
-      const bin = q(".sb-bin").checked;
+      const bin = q(".sb-bin").checked, snapshot = q(".sb-snap").checked;
       resetStats(n); S.runId = ++runSeq;
-      q(".sb-path").textContent = "path: " + (bin ? "binary" : "JSON");
+      // Name what actually ran: on the binary path the payload handling is half the comparison, and
+      // "binary" alone would label two runs with very different costs identically.
+      q(".sb-path").textContent = "path: " + (bin ? "binary · " + (snapshot ? "snapshot" : "by ref") : "JSON");
       const go = q(".sb-go"); go.disabled = true; go.textContent = "streaming…"; q(".sb-sum").textContent = "";
       S.ack = { bytes_per_frame: n * n * 4, frames };
       // This RPC spans the WHOLE stream, so on a long or backed-up run it times out in the browser
@@ -219,7 +227,7 @@
       // the drain/stall watchdogs finalize regardless. Only a run that produced nothing at all — no
       // frames, no tally — reports the error, because then it is the only evidence we have.
       const runId = S.runId;
-      api.call(channel + ":run", { n, frames, delayMs, run: runId, bin }).then(r => {
+      api.call(channel + ":run", { n, frames, delayMs, run: runId, bin, snapshot }).then(r => {
         if (!S || S.runId !== runId || S.finalized || S.final) return;
         S.emitDone = true; S.final = r;
         if (S.lastFrame === 0) S.lastFrame = performance.now();
@@ -241,6 +249,8 @@
       .sb input{width:66px;background:${C.bg};color:${C.text};border:1px solid #30363d;border-radius:5px;padding:3px 6px;font:inherit}
       .sb-go{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:6px 16px;cursor:pointer;font:inherit}
       .sb-go:disabled{opacity:.5;cursor:default}
+      .sb-binlab{display:flex;align-items:center;gap:5px} .sb-binlab input{width:auto}
+      .sb-binlab:has(input:disabled){opacity:.45}
       .sb-main{display:flex;gap:14px;align-items:stretch;margin-bottom:10px}
       .sb-field{width:150px;height:150px;image-rendering:pixelated;border-radius:8px;border:1px solid #21262d;background:${C.bg}}
       .sb-kpis{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px}
