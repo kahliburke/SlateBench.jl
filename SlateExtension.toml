@@ -1,0 +1,10 @@
+# Catalog listing for Slate's Extensions gallery. Every key is optional.
+
+tagline = "A live dashboard for Slate's streaming transport"
+icon    = "📈"
+categories = ["diagnostics"]
+
+example = "notebooks/bench.jl"
+
+# Hosted, not committed — see CesiumSlate's listing for the rationale.
+screenshots = ["https://github.com/kahliburke/SlateBench.jl/releases/download/media/SlateBench-notebook.png"]
