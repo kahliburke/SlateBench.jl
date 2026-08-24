@@ -1,6 +1,6 @@
 name = "SlateBench"
 uuid = "34dae1dd-9e9d-4399-81aa-9d72c5d23232"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Kahli Burke <kahli@kahliburke.com>"]
 
 [deps]
